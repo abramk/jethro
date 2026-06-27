@@ -81,11 +81,36 @@ let y = 42                         // ERROR: ambiguous numeric type
 
 - Algebraic types (sum + product) with exhaustive pattern matching
 - Affine types for resource safety (use-at-most-once ownership)
-- All types have value semantics (move by default, explicit `.copy()` when needed)
+- All types have value semantics (move by default, explicit `.clone()` when needed)
+- Primitives implicitly copy — `i32`, `f64`, `bool`, `char`, etc. User types always move.
 - Compiler decides stack vs heap via escape analysis — no Box/Rc/pointer types exposed
 - Primitives: `i8, i16, i32, i64`, `u8, u16, u32, u64`, `f32, f64`, `bool`, `char`, `byte`
 - Explicit `return` keyword required in multi-line bodies — no implicit returns
 - `=>` single-expression bodies have implicit return
+
+## Generics
+
+- Syntax: `<T>`, `<T, U>`, bounds inline: `<T : Comparable & Hashable>`
+- Declaration-site variance: `out T` (covariant, output only), `in T` (contravariant, input only), bare `T` (invariant)
+- Reified type parameters — `T` known at runtime via LLVM monomorphization
+  - Enables: `val is T`, `T.new()`, `T[]` creation, `switch` on type params
+- Type set bounds: `<T : numeric>`, inline: `<T : (i32 | f32) & Comparable>`
+- Mixed bounds: `<T : numeric & Serializable>`
+- No `where` clauses — all bounds inline in `<>`
+- Call-site type inference: `max(3, 5)` infers `T = i32`, `Box.new(42)` infers `Box<i32>`
+  ```
+  class List<out T> {
+      fn get(i32 index) T => ...         // T in output — ok
+      // fn add(T item) void { }         // error — out T can't be in input position
+  }
+  
+  class Consumer<in T> {
+      fn consume(T item) void { }        // T in input — ok
+      // fn produce() T { }              // error — in T can't be in output position
+  }
+  
+  fn max<T : Comparable>(T a, T b) T => if a > b { a } else { b }
+  ```
 
 ## Null, Void, and Never
 
@@ -202,13 +227,12 @@ fn getUser(UserId id) User {
 
 - Implicit `self` — trait methods are always instance methods, no `self` parameter in signatures
 
-- Static blocks for associated functions (factories, etc.) — no `self`, access private fields
+- No static methods on classes — module-level functions cover all use cases
 
 - Call site uses `.` for everything:
   
   - `instance.method()` — unambiguous trait method, no qualification needed
   - `instance.Trait::method()` — required only when multiple traits define same method name
-  - `Type.staticMethod()` — static call via type name
 
 - Traits can extend other traits — expresses "this trait requires that trait"
   
@@ -849,42 +873,38 @@ let job = <- queue     // queue.op.take()
 
 - Syntax: `{ params => body }` with `it` as implicit single parameter
 
-- Capture by copy (default) — closure gets its own copy of captured variables
+- Capture rules (follow RC memory model):
+  - Primitives → copy
+  - Objects → RC ref (ref count++, shared reference)
+  - Channels → RC ref (shared)
 
-- `ref` keyword for by-reference capture — listed in parameter list before `=>`
+- `spawn` restrictions:
+  - Can only capture primitives (copied) and channels (RC)
+  - Object captures in `spawn` = compiler error
+  - Use channels to send data to spawned tasks
 
-- `ref` captures cannot escape — compiler error if closure is passed to `spawn`
-
-- Compiler may optimize non-escaping copy captures to avoid actual copy
-
-- No borrow checker, no escape analysis visible to the user
-  
   ```
   // implicit single param
   list.filter { it > 5 }
-  
+
   // explicit param
   list.map { i32 x => x * 2 }
-  
-  // ref capture for mutation
+
+  // object capture — RC ref, mutable, aliased
+  let state = State.new()
+  list.each { i32 x => state.add(x) }     // state ref count++
+  print(state.size())                       // fine — same object
+
+  // primitive capture — copy, outer unchanged
   i32 sum = 0
-  list.each { i32 x, ref sum => sum += x }
-  
-  // multiple ref captures
-  i32 sum = 0
-  i32 count = 0
-  list.each { i32 x, ref sum, ref count =>
-      sum += x
-      count += 1
-  }
-  
-  // chained with ref
-  i32 total = 0
-  list.map { i32 x => x * 2 }.each { i32 x, ref total => total += x }
-  
-  // spawn — copy only, ref is compiler error
-  spawn { doWork(x) }           // ok — x copied in
-  spawn { ref sum => sum += 1 } // error: ref capture cannot escape
+  list.each { i32 x => sum += x }          // sum is a copy
+  // use fold instead:
+  let total = list.fold(0, { i32 acc, i32 x => acc + x })
+
+  // spawn — primitives and channels only
+  let ch = chan<Result>()
+  spawn { ch <- compute() }                // ok — ch is channel
+  spawn { state.process() }                // error — RC ref can't cross threads
   ```
 
 ## Tuples
@@ -1077,36 +1097,57 @@ let job = <- queue     // queue.op.take()
 
 ## Memory Model
 
-- Move by default on assignment — original variable becomes unusable
+- Everything is reference-counted (non-atomic, single-thread only)
+- Primitives (`i32`, `f64`, `bool`, `char`, etc.) are copy-by-value (not RC'd)
+- Assignment (`=`) creates another reference to the same object (ref count++)
+- No `:=` move operator — compiler optimizes last-use automatically (NRVO, elided retain/release)
+- Circular references are programmer's responsibility + debugging dump tool
+- Explicit clone via `Cloneable` trait — opt-in, compiler can auto-generate, overridable
+- Escape analysis for stack vs heap placement — compiler decides
 
-- Explicit clone via `Cloneable` trait — opt-in, not universal
+- Thread boundaries: no shared RC refs across threads
+  - `spawn` can only capture primitives and channels
+  - Must send objects via channel to share across threads
+  - Closures with RC captures in `spawn` = compiler error
 
-- `clone()` method — compiler can auto-generate field-by-field deep clone, overridable
+- Channels:
+  - `chan<T>` is RC shared across threads (the one exception)
+  - Data moved into channel on send, moved out on receive
 
-- Escape analysis for stack vs heap placement — compiler decides, not the programmer
+- Arrays:
+  - `T[]` — array is one RC object, elements are RC refs held by the array
+  - `arr[i]` returns another RC ref to the element (ref count++)
+  - Contiguous pointer layout internally, not contiguous values
+  - Primitive arrays (`i32[]`, `f64[]`) are contiguous values
+  - `arr.swap(i, j)` for in-place exchange
 
-- Ownership-based cleanup — value freed when owner goes out of scope (like Rust's Drop)
+- Compiler optimizations:
+  - NRVO — return values constructed directly in caller's space, no RC bump
+  - Last-use optimization — compiler elides retain/release when variable not used after
+  - Non-atomic RC is cheap (no cross-thread sharing eliminates atomic overhead)
 
-- No GC, no reference counting, no borrow checker
+- No GC, no borrow checker, no `T&` weak refs, no `:=` move operator
 
-- Circular references impossible with strict move semantics
-
-- Graphs and similar structures: use index-based approach (arena pattern)
-
-- `ref` in closures is a temporary borrow — can't escape to `spawn`
-  
   ```
-  i32[] a = [1, 2, 3]
-  i32[] b = a              // a is moved, unusable
-  i32[] c = b.clone()      // explicit clone — both b and c are valid
-  
-  // index-based graph
-  class Graph {
-      Node[] nodes
-  }
-  class Node {
-      i32 id
-      i32[] neighbors      // indices, not references
+  let a = Node.new(1)
+  let b = a              // same object, ref count 2
+  b.id = 42
+  print(a.id)            // 42 — aliased
+
+  let arr = [Node.new(1), Node.new(2)]
+  let n = arr[0]         // ref count 2 (arr + n)
+  arr = []               // arr releases — Node(1) still alive via n
+
+  // threads — channels only
+  let ch = chan<Node>()
+  ch <- node             // moved into channel
+  spawn { let n = <- ch; n.process() }
+
+  // factory — NRVO, no RC overhead
+  fn buildGraph() Graph {
+      let g = Graph.new()
+      // ... build ...
+      return g             // optimized — no ref count bump
   }
   ```
 
@@ -1118,6 +1159,12 @@ let job = <- queue     // queue.op.take()
 
 - `@ffi.union` on sealed trait — overlapping memory layout for C unions
 
+- `@ffi.packed` on `T[]` — contiguous value layout (like C arrays), same type as `T[]`
+  - Default `T[]` for objects = array of RC pointers
+  - `@ffi.packed T[]` = contiguous structs in memory
+  - Primitive arrays (`i32[]`, `f64[]`) are always contiguous
+  - A function accepting `T[]` accepts both layouts
+
 - `Ptr<T>` built-in for raw pointer interop (unsafe)
   
   ```
@@ -1127,12 +1174,38 @@ let job = <- queue     // queue.op.take()
       f64 y
   }
   
+  @ffi.packed Point[] points    // contiguous Point structs
+  Point[] nodes                  // RC pointer array (default)
+  i32[] nums                     // always contiguous (primitive)
+  
   @ffi("translate_point")
   fn cTranslate(Point p, f64 dx, f64 dy) Point
   
   @ffi("strlen")
   fn cStrlen(i8[] str) i64
   ```
+
+## Reflection
+
+- Read-only field access + method invocation — no setting fields via reflection
+- Respects visibility — private members not accessible through reflection
+- `typeOf(value)` for instances, `typeOf<T>()` for types
+- Reified generics make full type info available at runtime
+  ```
+  let t = typeOf(someValue)
+  t.name                            // "Point"
+  t.fields                          // List<Field>
+  t.methods                         // List<Method>
+  t.traits                          // List<Type>
+  t.annotations                     // List<Annotation>
+  
+  let f = t.field("x")
+  f.get(instance)                   // read value
+  
+  let m = t.method("distance")
+  m.invoke(instance, otherPoint)    // dynamic call
+  ```
+- Open: return type of `invoke` and `get` — needs a top type (`any`) or dynamic type (TBD)
 
 ## Runtime
 
@@ -1143,13 +1216,35 @@ let job = <- queue     // queue.op.take()
 - Can bypass libc and call syscalls directly where possible
 - Ship linker as part of the toolchain (LLVM's LLD)
 
+## Immutability
+
+- `const T` is a distinct type — not just a variable modifier
+- Transitive: everything accessed through `const T` is also const
+- Compiler infers which methods are mutating (writes to `self` fields)
+- Mutating methods cannot be called on `const T`
+- `T` → `const T` is always safe; `const T` → `T` is never allowed
+- Common type combinations:
+  - `const T` — RC ref, immutable
+  - `const T?` — RC ref, nullable, immutable
+  ```
+  fn get(i32 i) const Node => nodes[i]
+  
+  let n = container.get(0)     // const Node
+  print(n.name)                // ok — reading
+  n.name = "foo"               // error — const
+  n.rename("bar")              // error — rename mutates
+  let p = n.parent             // const Node — const propagates
+  ```
+
 ## Other Decisions
+
+- `defer` — executes statement when enclosing scope exits, LIFO order (like Go)
 
 - Comments: C-style only (`//` and `/* */`), no doc comments
 
 - `bigint`: library, not built-in
 
-- No reference equality — with move/copy semantics, no two references to same object
+- No reference equality — use `op.eq` for value equality
 
 - `op.string`: implicit on every class — compiler generates default (class name + fields), overridable
 
@@ -1191,3 +1286,53 @@ let job = <- queue     // queue.op.take()
   ```
   
   ```
+
+## Research / To Explore
+
+### 1. Failable operations as control flow
+
+Inspired by Verse's `<decides>` system. Instead of panicking or requiring separate bounds checks,
+operations that might not succeed return `T?` naturally:
+
+- `arr[i]` returns `T?` — fails (nil) on out-of-bounds instead of panic
+- `map[key]` returns `T?` — fails on missing key
+- Unifies validation with access — no separate check-then-act pattern
+- Works with existing `?:` elvis and smart-casting:
+  ```
+  let item = arr[i] ?: defaultValue
+  if arr[i] is Node n {
+      process(n)
+  }
+  ```
+- Question: should this be limited to collections, or extend to any operation that might not succeed?
+
+### 2. Richer concurrency patterns
+
+Inspired by Verse's structured concurrency primitives. Jethro has `within`/`spawn`/`select` — explore:
+
+- `race { }` — run multiple concurrent tasks, first to complete wins, cancel the rest
+  ```
+  let result = race {
+      spawn { fetchFromPrimary() }
+      spawn { sleep(5); error Timeout }
+  }
+  ```
+- `rush { }` — first to complete wins, but others continue in background
+- `branch { }` — structured fire-and-forget (canceled when enclosing scope exits)
+- How these interact with `within`, `select`, and channels
+- Cancellation semantics — cooperative via suspension points?
+
+### 3. Live variables / reactive bindings
+
+Inspired by Verse's live variables. Explore variable binding with automatic change notification:
+
+- A variable that automatically recomputes when its dependencies change
+- Change notification without explicit observer/callback registration
+- Potential syntax: `live x = y + 1` — x updates whenever y changes
+- Dynamic dependency tracking at runtime (only variables actually read are tracked)
+- `batch { }` to group mutations and defer notifications until complete
+- Questions:
+  - How does this interact with RC memory model? (dependency tracking needs to read variables)
+  - Library pattern vs language feature? (language = more power, library = less magic)
+  - Does this conflict with "no magic" philosophy, or is explicit `live` keyword enough?
+  - Use cases: UI binding, derived game state, config propagation
